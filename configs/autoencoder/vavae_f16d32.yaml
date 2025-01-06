@@ -1,0 +1,63 @@
+model:
+  base_learning_rate: 1.0e-4
+  target: ldm.models.autoencoder.AutoencoderKL
+  params:
+    monitor: "val/rec_loss"
+    embed_dim: 32
+    use_vf: dinov2
+    reverse_proj: True
+    lossconfig:
+      target: ldm.modules.losses.LPIPSWithDiscriminator
+      params:
+        disc_start: 1
+        kl_weight: 0.000001
+        disc_weight: 0.5
+
+        vf_weight: 0.1
+        adaptive_vf: True
+        vf_loss_type: combined_v3
+        distmat_margin: 0.25
+        cos_margin: 0.5
+
+    ddconfig:
+      double_z: True
+      z_channels: 32
+      resolution: 256
+      in_channels: 3
+      out_ch: 3
+      ch: 128
+      ch_mult: [ 1,1,2,2,4]  # num_down = len(ch_mult)-1
+      num_res_blocks: 2
+      attn_resolutions: [16]
+      dropout: 0.0
+
+
+data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size: 12
+    wrap: True
+    num_workers: 2
+    train:
+      target: ldm.data.myimagenet.ImageNetDataset
+      params:
+        data_root: /home/azureuser/v-yuqianhong/ImageNet/ILSVRC2012/train
+        size: 256
+    validation:
+      target: ldm.data.myimagenet.ImageNetDataset
+      params:
+        data_root: /home/azureuser/v-yuqianhong/ImageNet/ILSVRC2012/val
+        size: 256
+
+lightning:
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        batch_frequency: 1000
+        max_images: 8
+        increase_log_steps: True
+
+  trainer:
+    benchmark: True
+    accumulate_grad_batches: 2
