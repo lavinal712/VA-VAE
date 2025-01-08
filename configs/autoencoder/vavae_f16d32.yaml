@@ -41,12 +41,12 @@ data:
     train:
       target: ldm.data.myimagenet.ImageNetDataset
       params:
-        data_root: /home/azureuser/v-yuqianhong/ImageNet/ILSVRC2012/train
+        data_root: /path/to/ImageNet/ILSVRC2012/train
         size: 256
     validation:
       target: ldm.data.myimagenet.ImageNetDataset
       params:
-        data_root: /home/azureuser/v-yuqianhong/ImageNet/ILSVRC2012/val
+        data_root: /path/to/ImageNet/ILSVRC2012/val
         size: 256
 
 lightning:
