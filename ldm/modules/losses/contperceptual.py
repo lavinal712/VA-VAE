@@ -4,6 +4,13 @@ import torch.nn as nn
 from taming.modules.losses.vqperceptual import *  # TODO: taming dependency yes/no?
 
 
+def mean_flat(x):
+    """
+    Take the mean over all non-batch dimensions.
+    """
+    return torch.mean(x, dim=list(range(1, len(x.size()))))
+
+
 class LPIPSWithDiscriminator(nn.Module):
     def __init__(self, disc_start, logvar_init=0.0, kl_weight=1.0, pixelloss_weight=1.0,
                  disc_num_layers=3, disc_in_channels=3, disc_factor=1.0, disc_weight=1.0,
@@ -36,7 +43,7 @@ class LPIPSWithDiscriminator(nn.Module):
         self.distmat_margin = distmat_margin
         self.cos_margin = cos_margin
 
-    def calculate_adaptive_weight(self, nll_loss, g_loss, last_layer=None):
+    def calculate_adaptive_weight(self, nll_loss, g_loss, last_layer=None, threshold=1e4):
         if last_layer is not None:
             nll_grads = torch.autograd.grad(nll_loss, last_layer, retain_graph=True)[0]
             g_grads = torch.autograd.grad(g_loss, last_layer, retain_graph=True)[0]
@@ -45,7 +52,7 @@ class LPIPSWithDiscriminator(nn.Module):
             g_grads = torch.autograd.grad(g_loss, self.last_layer[0], retain_graph=True)[0]
 
         d_weight = torch.norm(nll_grads) / (torch.norm(g_grads) + 1e-4)
-        d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
+        d_weight = torch.clamp(d_weight, 0.0, threshold).detach()
         d_weight = d_weight * self.discriminator_weight
         return d_weight
 
@@ -103,12 +110,27 @@ class LPIPSWithDiscriminator(nn.Module):
                     mdms_loss = torch.mean(mdms_loss)
                     
                     vf_loss = mcos_loss + mdms_loss
+                elif self.vf_loss_type == "mcos_only":
+                    mcos_loss = 0.0
+                    bsz = z_prime.shape[0]
+                    for i, (z_prime_i, features_i) in enumerate(zip(z_prime, features)):
+                        z_prime_i = nn.functional.normalize(z_prime_i, dim=-1)
+                        features_i = nn.functional.normalize(features_i, dim=-1)
+                        cossim = mean_flat(-(z_prime_i * features_i).sum(dim=-1))
+                        mcos_loss += nn.functional.relu(1 - self.cos_margin - cossim)
+                    mcos_loss /= bsz
+                    
+                    vf_loss = mcos_loss
+                    
+                    weighted_nll_loss = torch.tensor(0.0, device=inputs.device)
+                    kl_loss = torch.tensor(0.0, device=inputs.device)
+                    g_loss = torch.tensor(0.0, device=inputs.device)
                 else:
                     raise ValueError(f"Unknown vf_loss_type: {self.vf_loss_type}")
                 
                 if self.adaptive_vf:
                     try:
-                        vf_weight = self.calculate_adaptive_weight(nll_loss, vf_loss, last_layer=encoder_last_layer)
+                        vf_weight = self.calculate_adaptive_weight(nll_loss, vf_loss, last_layer=encoder_last_layer, threshold=1e8)
                     except RuntimeError:
                         assert not self.training
                         vf_weight = torch.tensor(1.0)

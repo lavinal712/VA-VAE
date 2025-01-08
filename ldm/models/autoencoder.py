@@ -10,8 +10,10 @@ from ldm.modules.distributions.distributions import DiagonalGaussianDistribution
 
 from ldm.util import instantiate_from_config
 
+import timm
 from timm import create_model
 from torchvision import transforms
+from torchvision.transforms import Normalize
 
 
 class VQModel(pl.LightningModule):
@@ -319,10 +321,16 @@ class AutoencoderKL(pl.LightningModule):
             
         if use_vf is not None:
             if use_vf == "dinov2":
-                self.foundation_model = create_model(
-                    "vit_large_patch14_dinov2.lvd142m", pretrained=True, 
-                    img_size=ddconfig["resolution"], 
-                    patch_size=2 ** (len(ddconfig["ch_mult"]) - 1)
+                # self.foundation_model = create_model(
+                #     "vit_large_patch14_dinov2.lvd142m", pretrained=True, 
+                #     img_size=ddconfig["resolution"], 
+                #     patch_size=2 ** (len(ddconfig["ch_mult"]) - 1)
+                # )
+                self.foundation_model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitl14")
+                del self.foundation_model.head
+                patch_resolution = 16 * (ddconfig["resolution"] // 256)
+                self.foundation_model.pos_embed.data = timm.layers.pos_embed.resample_abs_pos_embed(
+                    self.foundation_model.pos_embed.data, [patch_resolution, patch_resolution]
                 )
                 for param in self.foundation_model.parameters():
                     param.requires_grad = False
@@ -379,6 +387,13 @@ class AutoencoderKL(pl.LightningModule):
         std = torch.tensor(std).view(1, -1, 1, 1).to(x.device)
         x = (x - mean) / std
         return x
+    
+    def rescale2(self, x):
+        resolution = x.shape[-1]
+        x = (x + 1.0) / 2.0
+        x = torch.nn.functional.interpolate(x, 224 * (resolution // 256), mode="bicubic")
+        x = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(x)
+        return x
 
     def training_step(self, batch, batch_idx, optimizer_idx):
         inputs = self.get_input(batch, self.image_key)
@@ -387,10 +402,11 @@ class AutoencoderKL(pl.LightningModule):
         z_prime = None
         features = None
         if self.use_vf is not None:
-            rescale_inputs = self.rescale(inputs)
+            # rescale_inputs = self.rescale(inputs)
+            rescale_inputs = self.rescale2(inputs)
             with torch.no_grad():
-                features = self.foundation_model.forward_features(rescale_inputs)[:, self.foundation_model.num_prefix_tokens:]
-            
+                # features = self.foundation_model.forward_features(rescale_inputs)[:, self.foundation_model.num_prefix_tokens:]
+                features = self.foundation_model.forward_features(rescale_inputs)["x_norm_patchtokens"]
             z = posterior.sample()
             if self.reverse_proj:
                 z_prime = z.flatten(2).transpose(1, 2)
@@ -422,9 +438,11 @@ class AutoencoderKL(pl.LightningModule):
         z_prime = None
         features = None
         if self.use_vf is not None:
-            rescale_inputs = self.rescale(inputs)
+            # rescale_inputs = self.rescale(inputs)
+            rescale_inputs = self.rescale2(inputs)
             with torch.no_grad():
-                features = self.foundation_model.forward_features(rescale_inputs)[:, self.foundation_model.num_prefix_tokens:]
+                # features = self.foundation_model.forward_features(rescale_inputs)[:, self.foundation_model.num_prefix_tokens:]
+                features = self.foundation_model.forward_features(rescale_inputs)["x_norm_patchtokens"]
             
             z = posterior.sample()
             if self.reverse_proj:
@@ -449,7 +467,8 @@ class AutoencoderKL(pl.LightningModule):
         opt_ae = torch.optim.Adam(list(self.encoder.parameters())+
                                   list(self.decoder.parameters())+
                                   list(self.quant_conv.parameters())+
-                                  list(self.post_quant_conv.parameters()),
+                                  list(self.post_quant_conv.parameters())+
+                                  list(self.proj.parameters()),
                                   lr=lr, betas=(0.5, 0.9))
         opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
                                     lr=lr, betas=(0.5, 0.9))
@@ -485,6 +504,33 @@ class AutoencoderKL(pl.LightningModule):
         x = F.conv2d(x, weight=self.colorize)
         x = 2.*(x-x.min())/(x.max()-x.min()) - 1.
         return x
+
+
+class AutoencodingEngine(AutoencoderKL):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        del self.quant_conv
+        del self.post_quant_conv
+
+    def encode(self, x):
+        h = self.encoder(x)
+        posterior = DiagonalGaussianDistribution(h)
+        return posterior
+    
+    def decode(self, z):
+        dec = self.decoder(z)
+        return dec
+    
+    def configure_optimizers(self):
+        lr = self.learning_rate
+        opt_ae = torch.optim.Adam(list(self.encoder.parameters())+
+                                  list(self.decoder.parameters())+
+                                  list(self.proj.parameters()),
+                                  lr=lr, betas=(0.5, 0.9))
+        opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
+                                    lr=lr, betas=(0.5, 0.9))
+        return [opt_ae, opt_disc], []
 
 
 class IdentityFirstStage(torch.nn.Module):
