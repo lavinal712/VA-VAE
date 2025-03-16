@@ -1,5 +1,6 @@
 from typing import Dict, Iterator, List, Optional, Tuple, Union
 
+import kornia
 import numpy as np
 import torch
 import torch.nn as nn
@@ -32,6 +33,13 @@ class GeneralLPIPSWithDiscriminator(nn.Module):
         regularization_weights: Union[None, Dict[str, float]] = None,
         additional_log_keys: Optional[List[str]] = None,
         discriminator_config: Optional[Dict] = None,
+        pp_style: bool = False,
+        vf_weight: float = 1.0e2,
+        adaptive_vf: bool = False,
+        cos_margin: float = 0.0,
+        distmat_margin: float = 0.0,
+        distmat_weight: float = 1.0,
+        cos_weight: float = 1.0,
     ):
         super().__init__()
         self.dims = dims
@@ -46,6 +54,8 @@ class GeneralLPIPSWithDiscriminator(nn.Module):
         assert disc_loss in ["hinge", "vanilla"]
         self.perceptual_loss = LPIPS().eval()
         self.perceptual_weight = perceptual_weight
+        self.distmat_weight = distmat_weight
+        self.cos_weight = cos_weight
         # output log variance
         self.logvar = nn.Parameter(
             torch.full((), logvar_init), requires_grad=learn_logvar
@@ -80,10 +90,23 @@ class GeneralLPIPSWithDiscriminator(nn.Module):
             "last_layer",
             "split",
             "regularization_log",
+            "z",
+            "aux_feature",
+            "enc_last_layer",
         ]
 
         self.additional_log_keys = set(default(additional_log_keys, []))
         self.additional_log_keys.update(set(self.regularization_weights.keys()))
+
+        self.pp_style = pp_style
+        if self.pp_style:
+            print("Using pp_style for nll loss")
+        self.vf_weight = vf_weight
+        self.adaptive_vf = adaptive_vf
+        self.cos_margin = cos_margin
+        self.distmat_margin = distmat_margin
+        self.cos_margin = cos_margin
+        self.distmat_margin = distmat_margin
 
     def get_trainable_parameters(self) -> Iterator[nn.Parameter]:
         return self.discriminator.parameters()
@@ -206,6 +229,21 @@ class GeneralLPIPSWithDiscriminator(nn.Module):
         d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
         d_weight = d_weight * self.discriminator_weight
         return d_weight
+    
+    def calculate_adaptive_weight_vf(
+        self, nll_loss: torch.Tensor, vf_loss: torch.Tensor, last_layer: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        if last_layer is not None:
+            nll_grads = torch.autograd.grad(nll_loss, last_layer, retain_graph=True)[0]
+            vf_grads = torch.autograd.grad(vf_loss, last_layer, retain_graph=True)[0]
+        else:
+            nll_grads = torch.autograd.grad(nll_loss, self.last_layer[0], retain_graph=True)[0]
+            vf_grads = torch.autograd.grad(vf_loss, self.last_layer[0], retain_graph=True)[0]
+
+        vf_weight = torch.norm(nll_grads) / (torch.norm(vf_grads) + 1e-4)
+        vf_weight = torch.clamp(vf_weight, 0.0, 1e8).detach()
+        vf_weight = vf_weight * self.vf_weight
+        return vf_weight
 
     def forward(
         self,
@@ -218,6 +256,9 @@ class GeneralLPIPSWithDiscriminator(nn.Module):
         last_layer: torch.Tensor,
         split: str = "train",
         weights: Union[None, float, torch.Tensor] = None,
+        z: Optional[torch.Tensor] = None,
+        aux_feature: Optional[torch.Tensor] = None,
+        enc_last_layer: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         if self.scale_input_to_tgt_size:
             inputs = torch.nn.functional.interpolate(
@@ -229,15 +270,45 @@ class GeneralLPIPSWithDiscriminator(nn.Module):
                 lambda x: rearrange(x, "b c t h w -> (b t) c h w"),
                 (inputs, reconstructions),
             )
+        if not self.pp_style:
+            rec_loss = self.pixel_loss(inputs.contiguous(), reconstructions.contiguous())
+            if self.perceptual_weight > 0:
+                p_loss = self.perceptual_loss(
+                    inputs.contiguous(), reconstructions.contiguous()
+                )
+                rec_loss = rec_loss + self.perceptual_weight * p_loss
 
-        rec_loss = self.pixel_loss(inputs.contiguous(), reconstructions.contiguous())
-        if self.perceptual_weight > 0:
-            p_loss = self.perceptual_loss(
-                inputs.contiguous(), reconstructions.contiguous()
-            )
-            rec_loss = rec_loss + self.perceptual_weight * p_loss
+            nll_loss, weighted_nll_loss = self.get_nll_loss(rec_loss, weights)
+        else:
+            rec_loss = self.pixel_loss(inputs.contiguous(), reconstructions.contiguous())
+            if self.perceptual_weight > 0:
+                p_loss = self.perceptual_loss(
+                    inputs.contiguous(), reconstructions.contiguous()
+                )
+                rec_loss = rec_loss + self.perceptual_weight * p_loss
+            nll_loss = rec_loss
+            weighted_nll_loss = nll_loss
+            if weights is not None:
+                weighted_nll_loss = weights * nll_loss
+            weighted_nll_loss = torch.mean(weighted_nll_loss)
+            nll_loss = torch.mean(nll_loss)
+        
+        # metrics
+        if not self.training:
+            metrics_inputs = (inputs.clamp(-1.0, 1.0) + 1.0) / 2.0
+            metrics_reconstructions = (reconstructions.clamp(-1.0, 1.0) + 1.0) / 2.0
+            psnr = kornia.metrics.psnr(metrics_inputs, metrics_reconstructions, max_val=1.0)
+            ssim = kornia.metrics.ssim(metrics_inputs, metrics_reconstructions, window_size=11, max_val=1.0)
+            lpips = p_loss if self.perceptual_weight > 0 else \
+                self.perceptual_loss(inputs.contiguous(), reconstructions.contiguous())
 
-        nll_loss, weighted_nll_loss = self.get_nll_loss(rec_loss, weights)
+            metrics_log = {
+                f"{split}/metrics/psnr": psnr.detach().mean(),
+                f"{split}/metrics/ssim": ssim.detach().mean(),
+                f"{split}/metrics/lpips": lpips.detach().mean(),
+            }
+        else:
+            metrics_log = {}
 
         # now the GAN part
         if optimizer_idx == 0:
@@ -250,7 +321,7 @@ class GeneralLPIPSWithDiscriminator(nn.Module):
                         nll_loss, g_loss, last_layer=last_layer
                     )
                 else:
-                    d_weight = torch.tensor(1.0)
+                    d_weight = torch.tensor(0.0)
             else:
                 d_weight = torch.tensor(0.0)
                 g_loss = torch.tensor(0.0, requires_grad=True)
@@ -263,6 +334,34 @@ class GeneralLPIPSWithDiscriminator(nn.Module):
                 if k in self.additional_log_keys:
                     log[f"{split}/{k}"] = regularization_log[k].detach().float().mean()
 
+            # vf loss
+            if z is not None and aux_feature is not None:
+                z_flat = rearrange(z, "b c h w -> b c (h w)")
+                aux_feature_flat = rearrange(aux_feature, "b c h w -> b c (h w)")
+                z_norm = torch.nn.functional.normalize(z_flat, dim=1)
+                aux_feature_norm = torch.nn.functional.normalize(aux_feature_flat, dim=1)
+                z_cos_sim = torch.einsum("bci,bcj->bij", z_norm, z_norm)
+                aux_feature_cos_sim = torch.einsum("bci,bcj->bij", aux_feature_norm, aux_feature_norm)
+                diff = torch.abs(z_cos_sim - aux_feature_cos_sim)
+                vf_loss_1 = torch.nn.functional.relu(diff - self.distmat_margin).mean()
+                vf_loss_2 = torch.nn.functional.relu(1 - self.cos_margin - torch.nn.functional.cosine_similarity(aux_feature, z)).mean()
+                vf_loss = vf_loss_1 * self.distmat_weight + vf_loss_2 * self.cos_weight
+            else:
+                vf_loss = None
+
+            if vf_loss is not None:
+                if self.adaptive_vf:
+                    try:
+                        vf_weight = self.calculate_adaptive_weight_vf(nll_loss, vf_loss, last_layer=enc_last_layer)
+                    except RuntimeError:
+                        assert not self.training
+                        vf_weight = torch.tensor(0.0)
+                else:
+                    vf_weight = self.vf_weight
+                loss = loss + vf_weight * vf_loss
+            else:
+                loss = loss
+
             log.update(
                 {
                     f"{split}/loss/total": loss.clone().detach().mean(),
@@ -273,6 +372,18 @@ class GeneralLPIPSWithDiscriminator(nn.Module):
                     f"{split}/scalars/d_weight": d_weight.detach(),
                 }
             )
+
+            if vf_loss is not None:
+                log.update(
+                    {
+                        f"{split}/loss/vf": vf_loss.detach().mean(),
+                        f"{split}/loss/vf_1": vf_loss_1.detach().mean(),
+                        f"{split}/loss/vf_2": vf_loss_2.detach().mean(),
+                        f"{split}/scalars/vf_weight": vf_weight.detach() if not isinstance(vf_weight, float) else torch.tensor(vf_weight),
+                    }
+                )
+
+            log.update(metrics_log)
 
             return loss, log
         elif optimizer_idx == 1:
@@ -290,6 +401,7 @@ class GeneralLPIPSWithDiscriminator(nn.Module):
                 f"{split}/logits/real": logits_real.detach().mean(),
                 f"{split}/logits/fake": logits_fake.detach().mean(),
             }
+            log.update(metrics_log)
             return d_loss, log
         else:
             raise NotImplementedError(f"Unknown optimizer_idx {optimizer_idx}")

@@ -12,6 +12,7 @@ from einops import rearrange
 from packaging import version
 from safetensors.torch import load_file as load_safetensors
 
+from .foundation_models import aux_foundation_model
 from ..modules.autoencoding.regularizers import AbstractRegularizer
 from ..modules.ema import LitEma
 from ..util import (default, get_nested_attribute, get_obj_from_str,
@@ -515,7 +516,13 @@ class AutoencodingEngineLegacy(AutoencodingEngine):
 
 
 class AutoencoderKL(AutoencodingEngineLegacy):
-    def __init__(self, **kwargs):
+    def __init__(
+        self,
+        use_vf: Optional[str] = None,
+        reverse_proj: bool = False,
+        proj_fix=False,
+        **kwargs,
+    ):
         if "lossconfig" in kwargs:
             kwargs["loss_config"] = kwargs.pop("lossconfig")
         super().__init__(
@@ -527,3 +534,213 @@ class AutoencoderKL(AutoencodingEngineLegacy):
             },
             **kwargs,
         )
+
+        embed_dim = kwargs.get("embed_dim", 16)
+        if use_vf is not None:
+            self.use_vf = use_vf
+            from sgm.models.foundation_models import aux_foundation_model
+            print(f"Using {use_vf} as auxiliary feature.")
+            self.foundation_model = aux_foundation_model(use_vf)
+            vf_feature_dim = self.foundation_model.feature_dim
+            self.linear_proj = torch.nn.Conv2d(vf_feature_dim, embed_dim, kernel_size=1, bias=True)
+            if reverse_proj:
+                self.linear_proj = torch.nn.Conv2d(embed_dim, vf_feature_dim, kernel_size=1, bias=False)
+        else:
+            self.use_vf = None
+        self.reverse_proj = reverse_proj
+        self.automatic_optimization = False
+        self.proj_fix = proj_fix
+
+    def forward(
+        self, x: torch.Tensor, **additional_decode_kwargs
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        z, reg_log = self.encode(x, return_reg_log=True)
+        dec = self.decode(z, **additional_decode_kwargs)
+        if self.use_vf is not None:
+            aux_feature = self.foundation_model(x)
+            if not self.reverse_proj:
+                aux_feature = self.linear_proj(aux_feature)
+                return z, dec, reg_log, z, aux_feature
+            else:
+                z_proj = self.linear_proj(z)
+                return z, dec, reg_log, z_proj, aux_feature
+        return z, dec, reg_log, None, None
+
+    def inner_training_step(
+        self, batch: dict, batch_idx: int, optimizer_idx: int = 0
+    ) -> torch.Tensor:
+        x = self.get_input(batch)
+        additional_decode_kwargs = {
+            key: batch[key] for key in self.additional_decode_keys.intersection(batch)
+        }
+        z, xrec, regularization_log, z_proj, aux_feature = self(x, **additional_decode_kwargs)
+        enc_last_layer = self.encoder.conv_out.weight
+        if hasattr(self.loss, "forward_keys"):
+            extra_info = {
+                "optimizer_idx": optimizer_idx,
+                "global_step": self.global_step,
+                "last_layer": self.get_last_layer(),
+                "split": "train",
+                "regularization_log": regularization_log,
+                "autoencoder": self,
+                "z": z_proj,
+                "aux_feature": aux_feature,
+                "enc_last_layer": enc_last_layer,
+            }
+            extra_info = {k: extra_info[k] for k in self.loss.forward_keys}
+        else:
+            extra_info = dict()
+
+        if optimizer_idx == 0:
+            # autoencode
+            out_loss = self.loss(x, xrec, **extra_info)
+            if isinstance(out_loss, tuple):
+                aeloss, log_dict_ae = out_loss
+            else:
+                # simple loss function
+                aeloss = out_loss
+                log_dict_ae = {"train/loss/rec": aeloss.detach()}
+
+            self.log_dict(
+                log_dict_ae,
+                prog_bar=False,
+                logger=True,
+                on_step=True,
+                on_epoch=True,
+                sync_dist=False,
+            )
+            self.log(
+                "loss",
+                aeloss.mean().detach(),
+                prog_bar=True,
+                logger=True,
+                on_epoch=False,
+                on_step=True,
+            )
+            return aeloss
+        elif optimizer_idx == 1:
+            # discriminator
+            discloss, log_dict_disc = self.loss(x, xrec, **extra_info)
+            # -> discriminator always needs to return a tuple
+            self.log_dict(
+                log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=True
+            )
+            return discloss
+        else:
+            raise NotImplementedError(f"Unknown optimizer {optimizer_idx}")
+
+    def _validation_step(self, batch: dict, batch_idx: int, postfix: str = "") -> Dict:
+        x = self.get_input(batch)
+
+        z, xrec, regularization_log, z_proj, aux_feature = self(x)
+        enc_last_layer = self.encoder.conv_out.weight
+        if hasattr(self.loss, "forward_keys"):
+            extra_info = {
+                "optimizer_idx": 0,
+                "global_step": self.global_step,
+                "last_layer": self.get_last_layer(),
+                "split": "val" + postfix,
+                "regularization_log": regularization_log,
+                "autoencoder": self,
+                "z": z_proj,
+                "aux_feature": aux_feature,
+                "enc_last_layer": enc_last_layer,
+            }
+            extra_info = {k: extra_info[k] for k in self.loss.forward_keys}
+        else:
+            extra_info = dict()
+        out_loss = self.loss(x, xrec, **extra_info)
+        if isinstance(out_loss, tuple):
+            aeloss, log_dict_ae = out_loss
+        else:
+            # simple loss function
+            aeloss = out_loss
+            log_dict_ae = {f"val{postfix}/loss/rec": aeloss.detach()}
+        full_log_dict = log_dict_ae
+
+        if "optimizer_idx" in extra_info:
+            extra_info["optimizer_idx"] = 1
+            discloss, log_dict_disc = self.loss(x, xrec, **extra_info)
+            full_log_dict.update(log_dict_disc)
+        self.log(
+            f"val{postfix}/loss/rec",
+            log_dict_ae[f"val{postfix}/loss/rec"],
+            sync_dist=True,
+        )
+        self.log_dict(full_log_dict, sync_dist=True)
+        return full_log_dict
+
+    def configure_optimizers(self) -> List[torch.optim.Optimizer]:
+        if self.trainable_ae_params is None:
+            ae_params = self.get_autoencoder_params()
+        else:
+            ae_params, num_ae_params = self.get_param_groups(
+                self.trainable_ae_params, self.ae_optimizer_args
+            )
+            logpy.info(f"Number of trainable autoencoder parameters: {num_ae_params:,}")
+        if self.use_vf is not None:
+            ae_params += list(self.linear_proj.parameters())
+        if self.trainable_disc_params is None:
+            disc_params = self.get_discriminator_params()
+        else:
+            disc_params, num_disc_params = self.get_param_groups(
+                self.trainable_disc_params, self.disc_optimizer_args
+            )
+            logpy.info(
+                f"Number of trainable discriminator parameters: {num_disc_params:,}"
+            )
+        opt_ae = self.instantiate_optimizer_from_config(
+            ae_params,
+            default(self.lr_g_factor, 1.0) * self.learning_rate,
+            self.optimizer_config,
+        )
+        opts = [opt_ae]
+        if len(disc_params) > 0:
+            opt_disc = self.instantiate_optimizer_from_config(
+                disc_params, self.learning_rate, self.optimizer_config
+            )
+            opts.append(opt_disc)
+
+        return opts
+
+    @torch.no_grad()
+    def log_images(
+        self, batch: dict, additional_log_kwargs: Optional[Dict] = None, **kwargs
+    ) -> dict:
+        log = dict()
+        additional_decode_kwargs = {}
+        x = self.get_input(batch)
+        additional_decode_kwargs.update(
+            {key: batch[key] for key in self.additional_decode_keys.intersection(batch)}
+        )
+
+        _, xrec, _, _, _ = self(x, **additional_decode_kwargs)
+        log["inputs"] = x
+        log["reconstructions"] = xrec
+        diff = 0.5 * torch.abs(torch.clamp(xrec, -1.0, 1.0) - x)
+        diff.clamp_(0, 1.0)
+        log["diff"] = 2.0 * diff - 1.0
+        # diff_boost shows location of small errors, by boosting their
+        # brightness.
+        log["diff_boost"] = (
+            2.0 * torch.clamp(self.diff_boost_factor * diff, 0.0, 1.0) - 1
+        )
+        if hasattr(self.loss, "log_images"):
+            log.update(self.loss.log_images(x, xrec))
+        with self.ema_scope():
+            _, xrec_ema, _, _, _ = self(x, **additional_decode_kwargs)
+            log["reconstructions_ema"] = xrec_ema
+            diff_ema = 0.5 * torch.abs(torch.clamp(xrec_ema, -1.0, 1.0) - x)
+            diff_ema.clamp_(0, 1.0)
+            log["diff_ema"] = 2.0 * diff_ema - 1.0
+            log["diff_boost_ema"] = (
+                2.0 * torch.clamp(self.diff_boost_factor * diff_ema, 0.0, 1.0) - 1
+            )
+        if additional_log_kwargs:
+            additional_decode_kwargs.update(additional_log_kwargs)
+            _, xrec_add, _, _, _ = self(x, **additional_decode_kwargs)
+            log_str = "reconstructions-" + "-".join(
+                [f"{key}={additional_log_kwargs[key]}" for key in additional_log_kwargs]
+            )
+            log[log_str] = xrec_add
+        return log

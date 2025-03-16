@@ -132,7 +132,7 @@ def get_parser(**parser_kwargs):
     parser.add_argument(
         "--projectname",
         type=str,
-        default="autoencoderkl",
+        default="vavae",
     )
     parser.add_argument(
         "-l",
@@ -556,6 +556,17 @@ if __name__ == "__main__":
         )
     melk_ckpt_name = None
     name = None
+    auto_resume = (
+        not opt.resume and
+        os.path.exists(opt.logdir) and
+        len(glob.glob(os.path.join(opt.logdir, "checkpoints", "*.ckpt"))) > 0
+    )
+    if auto_resume:
+        ckpt_path = os.path.join(opt.logdir, "checkpoints", "*.ckpt")
+        ckpt_path = glob.glob(ckpt_path)
+        ckpt_path = sorted(ckpt_path, key=lambda x: os.path.getmtime(x))[-1]
+        opt.resume = ckpt_path
+        print(f"Automatically resuming from checkpoint {ckpt_path}")
     if opt.resume:
         if not os.path.exists(opt.resume):
             raise ValueError("Cannot find {}".format(opt.resume))
