@@ -6,6 +6,9 @@ model:
     monitor: "val/loss/rec"
     disc_start_iter: 50001
     embed_dim: 32
+    use_vf: "dinov2"
+    reverse_proj: true
+    proj_fix: false
 
     ddconfig:
       attn_type: vanilla-xformers
@@ -30,6 +33,11 @@ model:
 
         regularization_weights:
           kl_loss: 1.0e-6
+
+        vf_weight: 0.5
+        adaptive_vf: true
+        distmat_margin: 0.25
+        cos_margin: 0.5
 
     optimizer_config:
       target: torch.optim.Adam
